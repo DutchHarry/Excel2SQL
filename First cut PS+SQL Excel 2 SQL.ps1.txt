@@ -1,0 +1,586 @@
+<#
+Hi
+
+Little 'Production line' to sort some 'EXCEL HELL':
+1.
+Powershell code to save Excel file as set of .CSVs with custom delimiter
+Uses Excel (here 2016) in background
+
+2.
+Then import in SQL staging table
+(SQL 2016 Developer here)
+
+3
+After that you can eat your heart out transforming it in any format you like (with or without SSIS)
+
+NOTE that I do change registry values to get Excel to save CSV with custom delimiter 
+
+The file used can be found at (about 250Kb):
+http://digital.nhs.uk/catalogue/PUB18887/qof-1415-region-nation-allV1.1.xlsx
+
+[code="plain"]
+#>
+<#
+TODO:
+- also save pivot and save filtered sheets as CSVs so recontruction possible without going back to original file
+
+WARNING:
+Temperarily changes registry List Separator to save CSV with custom separator
+HKCU:\Control Panel\International
+sList
+
+HISTORY:
+original based on VBA from about 2012
+transformed to PS 20160722
+
+added 20160831
+ # checking pivot objects
+   # assume max 1 per sheet  # save assumption in my line of work
+ # checking table objects
+   # assume max 1 per sheet  # save assumption in my line of work
+#>
+
+$i=1 # only used for debugging
+#$j=1 # only used for debugging
+#$k=0 # only used for debugging
+[string]$OutputDirectory = "E:\J\"   # place to save sheets as .CSVs
+[string]$ReplacementEnclosure = "£" # used when replacing newline, cr, and tabs inside cells with e.g. £n£, £c£, or £t£
+[string]$ExcelFile = "E:\J\qof-1415-region-nation-allV1.1.xls"
+[string]$ListSepNewSeparator = "¬" #
+# $objWorksheet = $objWorkbook.worksheets.item($i)
+# $objWorksheet.visible = $true  # = 2 # $xlSheetVeryHidden=2; $xlSheetHidden = 1;  $xlSheetVisible = -1
+# $OutputDirectory = "E:\J\"
+
+
+#Function SaveExcelAsCSVs {
+#param(
+#    [string]$ExcelFile = "S:\_ue\_test2_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.xlsx"
+#  , [string]$OutputDirectory = "E:\J\"
+#  , [string]$ReplacementEnclosure = "£" #
+#  , [string]$ListSepNewSeparator = "¬" #
+#)
+
+
+  # disable protected view, so Excel can open all .xls*
+  # HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Excel\Security\FileValidation with "EnableOnLoad"=dword:00000000
+  $registryPath = "HKCU:\Software\Microsoft\Office\16.0\Excel\Security\FileValidation"
+  $Name = "EnableOnLoad"
+  $value = "0"
+  If (!(Test-Path $registryPath)) {
+    New-Item -Path $registryPath -Force | Out-Null
+    New-ItemProperty -Path $registryPath -Name $name -Value $value `
+      -PropertyType DWORD -Force | Out-Null
+  } else {
+    New-ItemProperty -Path $registryPath -Name $name -Value $value `
+      -PropertyType DWORD -Force | Out-Null
+  }
+  # (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Office\16.0\Excel\Security\FileValidation" -Name "EnableOnLoad")
+  # Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Office\16.0\Excel\Security\FileValidation" -Name "EnableOnLoad"
+
+  # set list separator
+  $ListSepPath = "HKCU:\Control Panel\International"
+  $ListSepKey = "sList"
+  $ListSepCurrentSep = (Get-ItemProperty -Path $ListSepPath -Name $ListSepKey).$ListSepKey
+  Set-ItemProperty -Path $ListSepPath -Name $ListSepKey -Value $ListSepNewSeparator -Type string
+
+
+  $ExcelFileName = Split-Path -Path $ExcelFile -Leaf
+  $ExcelFilePath = Split-Path -Path $ExcelFile
+  $ExcelFileNameWhExtension = [System.IO.Path]::GetFileNameWithoutExtension($ExcelFileName)
+  $ExcelFilextension = [System.IO.Path]::GetExtension($ExcelFileName)
+
+# hash before opening
+$FileMD5Hash = Get-FileHash -Path $ExcelFile -Algorithm MD5
+
+  # Application layer START
+  [reflection.assembly]::LoadWithPartialName( "Microsoft.Office.Interop.Excel" ) | Out-Null
+  $objExcel = New-Object -ComObject Excel.Application
+  $objExcel.DisplayAlerts = $False 
+#  $objExcel.Visible = $True # for debugging only
+  
+  # Workbook layer START
+  $objWorkbook = $objExcel.Workbooks.Open($ExcelFile)
+  # save .xls as .xlsm and reopen
+  If ($ExcelFilextension -eq ".xls") {
+    #save and reopen
+    $xlOpenXMLWorkbookMacroEnabled = 52
+    $FileFormat = $xlOpenXMLWorkbookMacroEnabled
+		$objWorkbook.SaveAs($OutputDirectory + $ExcelFileNameWhExtension + ".xlsm", $FileFormat) | Out-Null
+		$objWorkbook.Close($false)  # close file without saving
+		$objWorkbook = $objExcel.Workbooks.Open($OutputDirectory + $ExcelFileNameWhExtension + ".xlsm") 
+  }
+
+  # initialise pivot checking vars
+  $SheetName = $null
+  $ExcelFileNameWhExtension = $null
+  $FoundPivotTables = $null
+  # handling worksheets START
+  For ($i=1; $i -le $objWorkbook.worksheets.count; $i++){  
+    # Worksheet layer
+    $objWorksheet = $objWorkbook.worksheets.item($i)
+    # check sheetname, if same as previous, it's pivottable, so ignore/delete and move to next
+    If ($objWorksheet.Name -eq ($ExcelFileNameWhExtension + '_$_' + $SheetName) ) {
+      $objWorkbook.worksheets.item($i).Delete()
+
+      $objWorksheet = $objWorkbook.worksheets.item($i)
+    }
+    # get worksheet name to use later
+    $SheetName = $objWorksheet.Name  # set sheetname
+
+    # select sheet
+    $objWorksheet.Select()
+
+    # unhide sheet 
+    $objWorksheet.Visible = $true  # $xlSheetVeryHidden = 2; $xlSheetHidden = 1;  $xlSheetVisible = -1
+
+    # unlock worksheet
+    $objWorksheet.UsedRange.Locked = $false;
+
+    # unhide columns
+    $objWorksheet.Cells.EntireColumn.Hidden = $False
+
+    # unhide rows
+    $objWorksheet.Cells.EntireRow.Hidden = $False
+
+
+    # check pivottables
+    $FoundPivotTables = $false  # reset flag
+      # IF THERE ARE PIVOT TABLES IT ASSUMES 1 PER SHEET HAVING A GRANDTOTAL TO EXPAND AFTER REMOVING FILTERS
+      # SO WILL PRODUCE WRONG RESULTS IF THERE ISN'T A GRAND TOTAL
+      # ALSO IGNORES ANY 'DATA' OUTSIDE PIVOT
+      # IGNORES ANY 'FILTERS' THAT ARE 'MEANINGFUL', THAT IS STUFF THE PRODUCER WANT'S US TO IGNORE, SO BE AWARE
+    If ($objWorksheet.PivotTables().Count -gt 0) {  # strangely won't work without ()
+      # set flag
+      $FoundPivotTables = $true
+      # eliminate pivot table
+      # assuming only 1
+      $objPivotTable = $objWorksheet.PivotTables(1)
+      # tablerange1 doesn't include page fields
+      # http://peltiertech.com/referencing-pivot-table-ranges-in-vba/      
+      # $objPivotTable.TableRange1.Select()
+      # $objPivotTable.TableRange2.Select()
+      # $objPivotTable.RowRange.Select()
+      # $objPivotTable.ColumnRange.Select()
+      # $objPivotTable.DataLabelRange.Select()
+      # $objPivotTable.DataBodyRange.Select()
+      # $objPivotTable.PageRange.Select()
+      # remove filters
+      $objPivotTable.ClearAllFilters()
+      # Label Filters
+      #  $objPivotTable.ClearLabelFilters()
+      # Manual Filters (the check boxes)
+      #  $objPivotTable.ClearManualFilters()
+      # Value Filters
+      #  $objPivotTable.ClearValueFilters()
+      
+      # select grand total cell to display all
+      $PTlastrow = $objPivotTable.TableRange1.Rows($objPivotTable.TableRange1.Rows.Count).Row
+      $PTlastcol = $objPivotTable.TableRange1.Columns($objPivotTable.TableRange1.Columns.Count).Column
+      #  $PTsource = $objWorksheet.Pivottables(1).SourceData  # source
+      #  $PTdata = $objWorksheet.Pivottables(1).GetPivotData()
+      $objWorksheet.Cells($PTlastrow,$PTlastcol).Select() | Out-Null
+      #  $ObjExcel.Selection.Address()
+      # OK: expands in new sheet BEFORE old one, so $i stays the same
+      $ObjExcel.Selection.ShowDetail = $true
+      
+      # DELETE ORIGINAL AND PROCESS AS BEFORE WITH SHEET NAME OF ORIGINAL
+      # THIS IS DONE ABOVE BY TESTING IF NEW SHEETNAME IS SAME AS PREVIOUS
+    }
+    
+    # remove filters (on filterred sheets
+    If ( $objWorksheet.Autofiltermode() -eq $true) {
+      # toggles autofilter
+      $objWorksheet.usedrange.Cells.autofilter()
+    }
+
+
+    #remove table object
+    # again assume there is only 1 table object per sheet
+    If ($objWorksheet.ListObjects.count -gt 0) {
+      #remove filters
+      If ($objWorksheet.ListObjects(1).ShowAutoFilter() = $true) {
+        $objWorksheet.ListObjects(1).Range.autofilter()
+        # unlist
+        $objWorksheet.ListObjects(1).Unlist
+      }
+    }
+
+    
+    # un-merge any cells
+    $objWorksheet.UsedRange.MergeCells = $false;
+
+
+    # value copy sheet
+    $xlPasteValues = -4163;
+    $xlPasteSpecialOperationNone = -4142;
+    [void]$objWorksheet.UsedRange.Copy();
+    [void]$objWorksheet.UsedRange.PasteSpecial($xlPasteValues,$xlPasteSpecialOperationNone,$true,$false);
+
+
+    # display formulas, so no numberreformatting is needed
+    $objExcel.ActiveWindow.DisplayFormulas = $True  # exports formulas to csv, so have to convert all to values first
+
+    # 15 digit numberformat to get maximum precision wh trailing zeros
+    # not needed after valuecopy and displayformulas
+    # $objWorksheet.UsedRange.NumberFormat = "#.###############"
+
+    # get original rows + columns counts
+    $orows = $objWorksheet.UsedRange.Rows.Count 
+    $ocolumns = $objWorksheet.UsedRange.Columns.Count 
+
+    # delete empty columns and rows
+    $xlCellTypeLastCell = 11
+    # delete empty rows
+    $rowsdeleted = 0
+    For ($j = $objWorksheet.UsedRange.SpecialCells($xlCellTypeLastCell).Row; $j -ge 1; $j--) {
+      If ($objExcel.WorksheetFunction.CountA($objWorksheet.Rows($j).Cells) -eq 0) {
+        ($objWorksheet.Cells.Item($j, 1).EntireRow).Delete() | Out-Null
+        $rowsdeleted++
+      }
+    }
+    # delete empty columns
+    $columnsdeleted = 0
+    For ($j = $objWorksheet.UsedRange.SpecialCells($xlCellTypeLastCell).Column; $j -ge 1; $j--) {
+      If ($objExcel.WorksheetFunction.CountA($objWorksheet.Columns($j).Cells) -eq 0) {
+        ($objWorksheet.Cells.Item(1, $j).EntireColumn).Delete() | Out-Null
+        $columnsdeleted++
+      }
+    }
+
+
+    # replace newline, carriage return, and tab inside cells
+    #$nl = [char]13+[char]10
+    #$nl = [char]10+[char]13
+    $nl = ""+[char]10  # [char]10 on it's own strangely replaces 10
+    $nlReplacement = "$ReplacementEnclosure"+"n"+"$ReplacementEnclosure"
+    $cr = ""+[char]13
+    $crReplacement = "$ReplacementEnclosure"+"c"+"$ReplacementEnclosure"
+    $tab = ""+[char]9
+    $tabreplacement = "$ReplacementEnclosure"+"t"+"$ReplacementEnclosure"
+    #$xlwhole = 1
+    $xlpart = 2
+    $objWorksheet.UsedRange.Replace($nl, $nlReplacement, $xlpart) | Out-Null
+    $objWorksheet.UsedRange.Replace($cr, $crReplacement, $xlpart) | Out-Null
+    $objWorksheet.UsedRange.Replace($tab, $tabReplacement, $xlpart) | Out-Null
+
+	  # detect 1st data row
+	  $mainheaderrow=0
+	  $firstdatarow = 0
+	  $currentmaxdatacells = 0
+	  $currentmaxdatacellsrow = 0
+	  $nrows = $objWorksheet.UsedRange.Rows.Count
+	  $ncolumns = $objWorksheet.UsedRange.Columns.Count
+	  For ($j=1; $j -le $nrows; $j++){
+	    $datacells = $objExcel.WorksheetFunction.CountA($objWorksheet.Rows($j).Cells)
+	    If ($datacells -eq $ncolumns) {
+	      # should be main header row or 1st datarow
+	      $mainheaderrow = $j
+	      $mainheadercells = $datacells
+	      # have to check if header or headerless
+	      If ($true) {break} # stop loop
+	    } else {
+	      If ($datacells -gt $currentmaxdatacells) {
+	        $currentmaxdatacells = $datacells
+	        $currentmaxdatacellsrow = $j
+	      }
+	    }
+	  }
+
+    # 2 rows for some data
+    $xlShiftDown = -4121
+    ($objWorksheet.cells.item(1,1).entireRow).insert($xlShiftDown) | Out-Null
+    ($objWorksheet.cells.item(1,1).entireRow).insert($xlShiftDown) | Out-Null
+    $objWorksheet.cells(1,1).value = "FullPath"
+    $objWorksheet.cells(2,1).value = $ExcelFile
+    $objWorksheet.cells(1,2).value = "FileDir"
+    $objWorksheet.cells(2,2).value = (Split-Path -Path $ExcelFile)
+    $objWorksheet.cells(1,3).value = "FileName"
+    $objWorksheet.cells(2,3).value = (Split-Path -Path $ExcelFile -Leaf)
+    $objWorksheet.cells(1,4).value = "FileSize"
+    $objWorksheet.cells(2,4).value = (Get-Item $ExcelFile).Length.ToString("0")
+    $objWorksheet.cells(1,5).value = "FileDate"
+    $objWorksheet.cells(2,5).value = (Get-Item $ExcelFile).LastWriteTime.ToShortDateString()
+    $objWorksheet.cells(1,6).value = "FileTime"
+    $objWorksheet.cells(2,6).value = (Get-Item $ExcelFile).LastWriteTime.ToShortTimeString()
+    $objWorksheet.cells(1,7).value = "FileMD5Hash"
+    $objWorksheet.cells(2,7).value = $FileMD5Hash.Hash
+    $objWorksheet.cells(1,8).value = "SheetName"
+    $objWorksheet.cells(2,8).value = $objWorksheet.Name
+    $objWorksheet.cells(1,9).value = "SheetNumber"
+    $objWorksheet.cells(2,9).value = $i.ToString("0")
+    $objWorksheet.cells(1,10).value = "OriginalNoRows"
+    $objWorksheet.cells(2,10).value = $orows.ToString("0")
+    $objWorksheet.cells(1,11).value = "OriginalNoColumns"
+    $objWorksheet.cells(2,11).value = $ocolumns.ToString("0")
+    $objWorksheet.cells(1,12).value = "NoOfRows"
+    $objWorksheet.cells(2,12).value = $objWorksheet.UsedRange.Rows.Count.ToString("0")
+    $objWorksheet.cells(1,13).value = "NoOfColumns"
+    $objWorksheet.cells(2,13).value = ($objWorksheet.UsedRange.Columns.Count + 1).ToString("0")  # 1 extra for numbering column
+    $objWorksheet.cells(1,14).value = "ProbableHeaderRow"
+    $objWorksheet.cells(2,14).value = ($mainheaderrow + 2).ToString("0")
+    $objWorksheet.cells(1,15).value = "ProbableHeaderCells"
+    $objWorksheet.cells(2,15).value = ($mainheadercells + 1).ToString("0")
+    $objWorksheet.cells(1,16).value = "ProbableDataRow"
+    $objWorksheet.cells(2,16).value = ($currentmaxdatacellsrow + 2).ToString("0")
+    $objWorksheet.cells(1,17).value = "ProbableDataRowCells"
+    $objWorksheet.cells(2,17).value = ($currentmaxdatacells + 1).ToString("0")
+    # if there is a gap in the header, you have to swap headerrow and datadata around
+    If ($mainheaderrow -gt $currentmaxdatacellsrow) {
+      $objWorksheet.cells(2,14).value = ($currentmaxdatacellsrow + 2).ToString("0")
+      $objWorksheet.cells(2,15).value = ($currentmaxdatacells + 1).ToString("0")
+      $objWorksheet.cells(2,16).value = ($mainheaderrow + 2).ToString("0")    
+      $objWorksheet.cells(2,17).value = ($mainheadercells + 1).ToString("0")
+    }
+    
+    # 1 columns for numbering
+    $xlToRight = -4161
+    ($objWorksheet.cells.item(1,1).entireColumn).insert($xlToRight) | Out-Null
+    For ($j=1; $j -le $objWorksheet.UsedRange.Rows.Count; $j++){  
+      $objWorksheet.cells($j,1).value = $j.ToString("0")
+    }
+
+
+    # save worksheets as CSVs
+    # https://msdn.microsoft.com/en-us/library/office/ff841185.aspx
+    # $xlTextMSDOS = 21  # delimiter TAB
+    # $xlTextWindows = 20  # delimiter TAB
+    $xlCSVWindows = 23  # delimiter will be the list delimiter in settings (default ','); works with £x£ replacements
+    # $xlCSVMSDOS = 24  # delimiter will be the list delimiter in settings (default ','); doesn't work with £x£ replacements
+    # $xlcsv = 6  # delimiter ','
+    $FileFormat = $xlCSVWindows                    #   2nd
+    # $Password = ''                                 # 1 3rd
+    # $WriteResPassword =''                          # 2 4th
+    # $ReadOnlyRecommended = $false                  # 3 5th
+    # $CreateBackup = $false                         # 4 6th
+    # $xlNoChange = 1
+    # $AccessMode = $xlNoChange                      # 5 7th
+    # $xlLocalSessionChanges = 2
+    # $ConflictResolution = $xlLocalSessionChanges   # 6 8th
+    # $AddToMru = $false                             # 7 9th
+    # $TextCodepage = '1252'                         #   ignored           
+    # $TextVisualLayout =""                          #   ignored  ???
+    $Local = $true                                 # 8 10th
+    $ExcelFileName = Split-Path -Path $ExcelFile -Leaf
+    # $ExcelFilePath = Split-Path -Path $ExcelFile
+    $ExcelFileNameWhExtension = [System.IO.Path]::GetFileNameWithoutExtension($ExcelFileName)
+    # $ExcelFilextension = [System.IO.Path]::GetExtension($ExcelFileName)
+    $CSVLocation = $OutputDirectory
+
+    # working but didn't seem to stack up with documentation (initially)
+    #                    1                                                                       2            3  4  5  6  7  8  9  10  
+    #                                                                                                         1  2  3  4  5  6  7  8
+    $objWorksheet.SaveAs($CSVLocation + $ExcelFileNameWhExtension + '_$_' + $SheetName + ".csv", $FileFormat, 0, 0, 0, 0, 0, 0, 0, $Local) | Out-Null
+
+  }  
+  # handling worksheets END
+
+$objWorkbook.Close($false)  # close file without saving
+# Workbook layer END
+
+# close and cleanup START
+$objExcel.Quit()  # quit excel
+
+
+  # release objects
+  If ($FoundPivotTables -eq $true) {
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($objPivotTable)
+    [System.GC]::Collect() | Out-Null;
+    [System.GC]::WaitForPendingFinalizers() | Out-Null;
+    Remove-Variable -Name objPivotTable
+  }
+  [System.Runtime.Interopservices.Marshal]::ReleaseComObject($objWorksheet) | Out-Null;
+  [System.GC]::Collect() | Out-Null;
+  [System.GC]::WaitForPendingFinalizers() | Out-Null;
+  [System.Runtime.Interopservices.Marshal]::ReleaseComObject($objWorkbook) | Out-Null;
+  [System.GC]::Collect() | Out-Null;
+  [System.GC]::WaitForPendingFinalizers() | Out-Null;
+  [System.Runtime.Interopservices.Marshal]::ReleaseComObject($objExcel) | Out-Null;
+  [System.GC]::Collect() | Out-Null;
+  [System.GC]::WaitForPendingFinalizers() | Out-Null;
+
+  Remove-Variable -Name objWorksheet
+  Remove-Variable -Name objWorkbook
+  Remove-Variable -Name objExcel
+  # close and cleanup END
+
+  # Application layer END
+
+  # reset list separator
+  Set-ItemProperty -Path $ListSepPath -Name $ListSepKey -Value $ListSepCurrentSep -Type string
+
+  # re-enable protected view
+  Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Office\16.0\Excel\Security\FileValidation" -Name "EnableOnLoad"
+
+  
+#} # Function SaveExcelAsCSVs
+
+<#
+[/code]
+
+
+After this import in SQL staging table
+
+[code="sql"]
+/*
+PURPOSE: 
+Import .CSV files with custom delimiter into staging table
+Using BULK INSERT to avoid truncations if to many characters (you may have to change columnsizes for that!)
+
+Adapt and Wrap this in a loop to do several files in the same final staging table
+Make sure to comment out the DROP of @StagingTable2 in the loop
+*/
+
+
+
+DECLARE @NoOfColumns smallint;  --for BULK INSERT VIEW
+DECLARE @delimiter varchar(10); SET @delimiter = '¬';  -- bit of an unusual character in my line of work, so unlikely to appear in the data columns themselves
+
+DECLARE @insertsql nvarchar(max);
+DECLARE @sql nvarchar(max);
+DECLARE @directory varchar(1000); SET @directory = 'E:\J\';
+DECLARE @filename varchar(1000); SET @filename = 'qof-1415-region-nation-allV1.1_$_AF.csv';
+--staging tables and views
+DECLARE @OneColumnStagingTable varchar(255); SET @OneColumnStagingTable = '_1ColumnsMaxNoIDx'  --for first row to count delimiters
+DECLARE @StagingTable1 varchar(255); SET @StagingTable1 = '_255Columns2500IDx'; --255 columns of varchar(2500) with ID int column at end or other staging dummys with sufficient columns and column sizes
+DECLARE @StagingTable2 varchar(255); SET @StagingTable2 = '_255Columns2500NoIDx'; --255 columns of varchar(2500) with NO ID int column at end or other staging dummys with sufficient columns and column sizes
+DECLARE @StagingView varchar(255); SET @StagingView = '_VwStaging';
+-- for staging table CREATE scripts (override for particular tables)
+DECLARE @withID varchar(1);        SET @withID = 'n';          -- 'y' if ID column at end of table
+DECLARE @withRemainder varchar(1); SET @withRemainder = 'n';   -- 'y' if Remainder column at end of table (but before ID)
+DECLARE @ColumnSize varchar(10);   SET @ColumnSize = '2500'    -- anything from '1' to '8000' or 'max'
+DECLARE @NumberOfColumns smallint; SET @NumberOfColumns = 255; -- anything from 1 to 1022 for CREATE TABLE   limit to 1022 to allow for Remainder varchar(8000), and ID int columns
+
+
+-- STEP 0: run powershell script to convert Excel files into a bunch of CSV files, preserving all data and precision, and with appropriate custom delimiter
+
+
+-- STEP 0b: CREATE SOME STAGING TABLES AND VIEW
+SET @sql = N'DROP TABLE IF EXISTS ' + @OneColumnStagingTable + ';';
+--PRINT @sql;
+EXEC(@sql);
+
+SET @withID = 'n';
+SET @withRemainder = 'n';
+SET @ColumnSize = 'max';
+SET @NumberOfColumns = 1;
+SELECT @sql = N'CREATE TABLE ' + @OneColumnStagingTable + '(' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+'] varchar(' + @ColumnSize + ') NULL'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NumberOfColumns
+FOR XML PATH('')),1,1,'') + CASE WHEN @withRemainder = 'y' THEN ', [Remainder] varchar(8000) NULL' ELSE '' END + CASE WHEN @withID = 'y' THEN ', [ID] int IDENTITY(1,1)' ELSE '' END + ' )';
+--PRINT @sql;
+EXEC(@sql);
+
+
+SET @sql = N'DROP TABLE IF EXISTS ' + @StagingTable1 + ';';
+--PRINT @sql;
+EXEC(@sql);
+
+SET @withID = 'y';
+SET @withRemainder = 'n';
+SET @ColumnSize = '2500';
+SET @NumberOfColumns = 255;
+-- temp table #TEMP would vanish when outside scope of dynamic SQL
+SELECT @sql = N'CREATE TABLE ' + @StagingTable1 + '(' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+'] varchar(' + @ColumnSize + ') NULL'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NumberOfColumns
+FOR XML PATH('')),1,1,'') + CASE WHEN @withRemainder = 'y' THEN ', [Remainder] varchar(8000) NULL' ELSE '' END + CASE WHEN @withID = 'y' THEN ', [ID] int IDENTITY(1,1)' ELSE '' END + ' )';
+--PRINT @sql;
+EXEC(@sql);
+
+
+SET @sql = N'DROP TABLE IF EXISTS ' + @StagingTable2 + ';';
+--PRINT @sql;
+EXEC(@sql);
+
+SET @withID = 'n';
+SET @withRemainder = 'n';
+SET @ColumnSize = '2500';
+SET @NumberOfColumns = 255;
+-- temp table #TEMP would vanish when outside scope of dynamic SQL
+SELECT @sql = N'CREATE TABLE ' + @StagingTable2 + '(' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+'] varchar(' + @ColumnSize + ') NULL'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NumberOfColumns
+FOR XML PATH('')),1,1,'') + CASE WHEN @withRemainder = 'y' THEN ', [Remainder] varchar(8000) NULL' ELSE '' END + CASE WHEN @withID = 'y' THEN ', [ID] int IDENTITY(1,1)' ELSE '' END + ' )';
+--PRINT @sql;
+EXEC(@sql);
+
+
+-- STEP 1: GET FIRST ROW TO COUNT DELIMITERS
+SET @sql = N'
+BULK INSERT [' + @OneColumnStagingTable + ']
+FROM ''' + @directory + @filename + '''
+WITH (
+  CODEPAGE = ''RAW''
+,  FIRSTROW = 1
+, LASTROW = 1
+, FIELDTERMINATOR = ''\n''
+, ROWTERMINATOR = ''\n''
+);';
+--PRINT @sql;
+EXEC(@sql);
+
+SET @sql = N'SELECT @NoOfColumns = LEN([Column0001]) - LEN(REPLACE([Column0001],''' + @delimiter + ''','''')) + 1 FROM [' + @OneColumnStagingTable + '];';
+--PRINT @sql;
+EXEC sp_executesql @sql, N'@NoOfColumns int out', @NoOfColumns out;
+--SELECT @NoOfColumns;
+
+
+-- CREATE VIEW ON STAGING TABLE
+SET @sql = N'DROP VIEW IF EXISTS [' + @StagingView + '];';
+--PRINT @sql;
+EXEC(@sql);
+
+SELECT @sql = N'CREATE VIEW [' + @StagingView + '] AS SELECT ' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+']'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NoOfColumns 
+FOR XML PATH('')),1,1,'') + ' FROM [' + @StagingTable1 + '];';
+--PRINT @sql;
+EXEC(@sql);
+
+
+-- STEP 2: IMPORT INTO FIRST STAGING TABLE (TO GET IDs)
+SET @sql = N'
+BULK INSERT [' + @StagingView + ']
+FROM ''' + @directory + @filename + '''
+WITH (
+  CODEPAGE = ''RAW''
+, FIELDTERMINATOR = ''' + @delimiter + '''
+, ROWTERMINATOR = ''\n''
+);';
+--PRINT @sql;
+EXEC(@sql);
+
+
+-- STEP 3: INSERT INTO FINAL STAGING TABLE: with directory file and lineID info
+SELECT @insertsql = N'INSERT INTO [' + @StagingTable2 + '](' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+']'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NoOfColumns + 5  --for added columns: directory, file, RN, and 2 for further processing
+FOR XML PATH('')),1,1,'') + ')';
+--PRINT @insertsql;
+
+SELECT @sql = N'
+SELECT ''' + @directory + ''',''' + @filename + ''', [ID], NULL, NULL, ' + STUFF((SELECT ',[Column'+RIGHT(CONVERT(varchar(5),10000+[number]+1),4)+']'
+FROM master..spt_values
+WHERE [type]='P' AND [number] < @NoOfColumns 
+FOR XML PATH('')),1,1,'') + ' FROM [' + @StagingTable1 + ']';
+--PRINT @sql;
+SET @sql = @insertsql + @sql
+--PRINT @sql;
+EXEC(@sql);
+
+
+-- STEP 4: CHECK
+SELECT @sql = N'
+SELECT * FROM [' + @StagingTable2 + ']';
+--PRINT @sql;
+EXEC(@sql);
+
+
+
+[/code]
+
+
+Would love to see suggestions for increased functionality/performance, especially non-SSIS suggestions.
+
+#>
+
