@@ -13,4 +13,4 @@ http://www.sqlservercentral.com/Forums/Topic1664634-364-1.aspx
 
 Please note that (amazingly) handling .CSV files seems not formally 'supported' by any MS tool (couldn't find the page that actually states this unambiguously, that fast, so 'seems' instead of 'is' for now).
 
-Note: only since SQL2016 MS provides a FORMAT = 'CSV' switch in BULK INSERT making it treat CSVs like Excel does, thus solving some of the pain.
+Note: only since SQL2017 MS provides a FORMAT = 'CSV' switch in BULK INSERT making it treat CSVs like Excel does, thus solving some of the pain.
